@@ -5,3 +5,10 @@ from .signal_analysis import (
     detect_sudden_changes,
     extract_trend,
 )
+from .trend_alignment import (
+    AlignmentConfig,
+    align_signals,
+    analyze_trend_alignment,
+    compute_optimal_lag,
+    directional_agreement,
+)
