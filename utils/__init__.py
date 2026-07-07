@@ -12,3 +12,8 @@ from .trend_alignment import (
     compute_optimal_lag,
     directional_agreement,
 )
+from .robot_visualizer import (
+    RobotVisualizer,
+    joint_map_dataset_to_urdf,
+    parse_urdf,
+)
