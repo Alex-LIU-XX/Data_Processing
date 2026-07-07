@@ -1,0 +1,33 @@
+[project]
+name = "data-processing"
+version = "0.1.0"
+description = "LeRobot dataset processing utilities"
+requires-python = ">=3.10"
+dependencies = [
+    "datasets>=3.0.0",
+    "lerobot",
+    "numpy>=1.22.4,<2.0.0",
+    "packaging>=23.0",
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+    "torch>=2.0.0",
+]
+
+[tool.uv.sources]
+lerobot = { git = "https://v4.gh-proxy.org/https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.10.0",
+    "pytest>=8.3.4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["data/"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
