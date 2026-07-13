@@ -1,3 +1,6 @@
+"""
+python data_cleaning_pipeline.py example_data/pick_banana_100_newTable_1_offset_state --stages S1_SuddenChange S3_ExtremeValue
+"""
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -64,6 +67,112 @@ class CleaningReport:
 
 # ─── 数据加载 ───────────────────────────────────────────────────────────────
 
+def _compute_array_stats(arr: np.ndarray) -> dict[str, list[float]]:
+    """计算数组的统计量 (min, max, mean, std, count, q01/q10/q50/q90/q99)。"""
+    arr = np.asarray(arr, dtype=np.float64)
+    return {
+        "min": np.min(arr, axis=0).tolist(),
+        "max": np.max(arr, axis=0).tolist(),
+        "mean": np.mean(arr, axis=0).tolist(),
+        "std": np.std(arr, axis=0).tolist(),
+        "count": [int(arr.shape[0])] * arr.shape[1],
+        "q01": np.percentile(arr, 1, axis=0).tolist(),
+        "q10": np.percentile(arr, 10, axis=0).tolist(),
+        "q50": np.percentile(arr, 50, axis=0).tolist(),
+        "q90": np.percentile(arr, 90, axis=0).tolist(),
+        "q99": np.percentile(arr, 99, axis=0).tolist(),
+    }
+
+
+def _compute_scalar_stats(series: np.ndarray) -> dict[str, float]:
+    """计算标量序列的统计量。"""
+    series = np.asarray(series, dtype=np.float64)
+    return {
+        "min": float(series.min()),
+        "max": float(series.max()),
+        "mean": float(series.mean()),
+        "std": float(series.std()),
+        "count": int(len(series)),
+        "q01": float(np.percentile(series, 1)),
+        "q10": float(np.percentile(series, 10)),
+        "q50": float(np.percentile(series, 50)),
+        "q90": float(np.percentile(series, 90)),
+        "q99": float(np.percentile(series, 99)),
+    }
+
+
+def _copy_and_update_meta(
+    src_root: Path,
+    dst_root: Path,
+    states: np.ndarray,
+    actions: np.ndarray,
+    df: pd.DataFrame,
+    report: "CleaningReport",
+):
+    """复制 meta 文件并更新 state/action 相关的统计量。"""
+    src_meta = src_root / "meta"
+    dst_meta = dst_root / "meta"
+    dst_meta.mkdir(parents=True, exist_ok=True)
+
+    # 1. 复制不变的 meta 文件
+    for fname in ["action_patch_info.json", "tasks.parquet"]:
+        f = src_meta / fname
+        if f.exists():
+            import shutil
+            shutil.copy2(f, dst_meta / fname)
+
+    # 2. 更新 stats.json
+    with open(src_meta / "stats.json") as f:
+        stats = json.load(f)
+    stats["observation.state"] = _compute_array_stats(states)
+    stats["action"] = _compute_array_stats(actions)
+    # 标量特征
+    for col in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
+        if col in stats:
+            stats[col] = _compute_scalar_stats(df[col].values)
+    with open(dst_meta / "stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+    report.add("META", "Updated stats.json (observation.state)")
+
+    # 3. 更新 episodes parquet (per-episode state/action stats)
+    ep_files = sorted((src_meta / "episodes").rglob("*.parquet"))
+    if ep_files:
+        ep_df = pd.read_parquet(ep_files[0])
+        ep_indices = df["episode_index"].values
+        for idx in range(len(ep_df)):
+            ep_id = ep_df.iloc[idx]["episode_index"]
+            mask = ep_indices == ep_id
+            ep_states = states[mask]
+            ep_actions = actions[mask]
+            if len(ep_states) > 0:
+                for stat_name in ["min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99"]:
+                    col = f"stats/observation.state/{stat_name}"
+                    if col in ep_df.columns:
+                        values = _compute_array_stats(ep_states)[stat_name]
+                        ep_df.at[idx, col] = values
+                    col_a = f"stats/action/{stat_name}"
+                    if col_a in ep_df.columns:
+                        values = _compute_array_stats(ep_actions)[stat_name]
+                        ep_df.at[idx, col_a] = values
+        # 更新长度等
+        ep_df["length"] = ep_df["episode_index"].apply(
+            lambda eid: int((df["episode_index"].values == eid).sum())
+        )
+        # 保存
+        ep_out_dir = dst_meta / "episodes" / "chunk-000"
+        ep_out_dir.mkdir(parents=True, exist_ok=True)
+        ep_df.to_parquet(ep_out_dir / "file-000.parquet", index=False)
+        report.add("META", f"Updated episodes parquet ({len(ep_df)} episodes)")
+
+    # 4. 更新 info.json (total_frames 可能变化)
+    with open(src_meta / "info.json") as f:
+        info = json.load(f)
+    info["total_frames"] = len(df)
+    with open(dst_meta / "info.json", "w") as f:
+        json.dump(info, f, indent=2)
+    report.add("META", f"Updated info.json (total_frames={len(df)})")
+
+
 class LeRobotDataset:
     """读取 LeRobot v3.0 格式数据集"""
 
@@ -121,6 +230,7 @@ def s1_sudden_change_detection(
     config: CleaningConfig,
     report: CleaningReport,
     dim_names: Optional[list[str]] = None,
+    name_prefix: str = "",
 ) -> np.ndarray:
     """
     检测突变帧并用平滑值替代（非丢弃）。
@@ -171,9 +281,9 @@ def s1_sudden_change_detection(
         if n_flagged > 0:
             raw[flagged] = smoothed[flagged]  # 用平滑值替代，而非丢弃
             name = dim_names[d] if dim_names else f"dim_{d}"
-            report.add("S1", f"{name}: smoothed {n_flagged} frames", {"smoothed_frames": int(n_flagged)})
+            report.add("S1", f"{name_prefix}{name}: smoothed {n_flagged} frames", {"smoothed_frames": int(n_flagged)})
 
-    report.add("S1", f"Total smoothed: {(~valid).sum()} / {N} frames")
+    report.add("S1", f"Total smoothed ({name_prefix or 'state'}): {(~valid).sum()} / {N} frames")
     return valid
 
 
@@ -262,6 +372,7 @@ def s3_extreme_value_filtering(
     config: CleaningConfig,
     report: CleaningReport,
     dim_names: Optional[list[str]] = None,
+    name_prefix: str = "",
 ) -> np.ndarray:
     """
     基于 Q1/Q99 的极值裁剪（非丢弃）。
@@ -280,7 +391,7 @@ def s3_extreme_value_filtering(
 
         # 夹爪豁免
         if config.s3_gripper_exempt and dim_names and "gripper" in dim_names[d].lower():
-            report.add("S3", f"{name}: exempted (gripper)")
+            report.add("S3", f"{name_prefix}{name}: exempted (gripper)")
             continue
 
         lower = q01 - config.s3_alpha * (q99 - q01)
@@ -289,10 +400,10 @@ def s3_extreme_value_filtering(
         flagged = (col < lower) | (col > upper)
         if flagged.sum() > 0:
             col[flagged] = np.clip(col[flagged], lower, upper)  # 裁剪到边界，而非丢弃
-            report.add("S3", f"{name}: {flagged.sum()} frames clipped to [{lower:.4f}, {upper:.4f}]",
+            report.add("S3", f"{name_prefix}{name}: {flagged.sum()} frames clipped to [{lower:.4f}, {upper:.4f}]",
                        {"clipped_frames": int(flagged.sum())})
 
-    report.add("S3", f"Total clipped: {(~valid).sum()} / {N} frames")
+    report.add("S3", f"Total clipped ({name_prefix or 'state'}): {(~valid).sum()} / {N} frames")
     return valid
 
 
@@ -566,6 +677,50 @@ class DataCleaningPipeline:
         Path(path).write_text(json.dumps(self.report.stage_logs, indent=2, default=str))
         print(f"\nReport saved to {path}")
 
+    def save_dataset(self, out_root: str):
+        """以 LeRobot v3.0 格式保存清洗后的数据集。
+
+        创建完整的数据集目录结构，更新 meta 统计信息，复制视频等。
+        """
+        out_path = Path(out_root)
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        # 1. 获取清洗后的 DataFrame，并将修改后的 state/action 写回
+        clean_df = self.get_clean_data()
+        states = self._states
+        actions = self._actions
+        clean_df["observation.state"] = [states[i] for i in range(len(states))]
+        clean_df["action"] = [actions[i] for i in range(len(actions))]
+
+        # 2. 保存 data parquet
+        data_dir = out_path / "data" / "chunk-000"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        data_parquet = data_dir / "file-000.parquet"
+        clean_df.to_parquet(data_parquet, index=False)
+        print(f"  Data saved: {data_parquet} ({len(clean_df)} frames)")
+
+        # 3. 复制视频
+        src_video = self.dataset.root / "videos"
+        if src_video.exists():
+            dst_video = out_path / "videos"
+            import shutil
+            if dst_video.exists():
+                shutil.rmtree(dst_video)
+            shutil.copytree(src_video, dst_video)
+            print(f"  Videos copied: {src_video} → {dst_video}")
+
+        # 4. 复制并更新 meta
+        _copy_and_update_meta(
+            self.dataset.root, out_path, states, actions, clean_df, self.report
+        )
+
+        # 5. 保存报告
+        report_path = out_path / "meta" / "cleaning_report.json"
+        Path(report_path).write_text(
+            json.dumps(self.report.stage_logs, indent=2, default=str)
+        )
+        print(f"  Report saved: {report_path}")
+
     def _apply_mask(self, mask: np.ndarray, name: str) -> np.ndarray:
         new_mask = self._frame_mask.copy()
         new_mask[~mask] = False
@@ -575,11 +730,14 @@ class DataCleaningPipeline:
         return new_mask
 
     def _run_s1(self, current_mask: np.ndarray) -> np.ndarray:
-        subset = self._states[current_mask]
-        if len(subset) == 0:
+        subset_st = self._states[current_mask]
+        subset_ac = self._actions[current_mask]
+        if len(subset_st) == 0:
             return current_mask
-        s1_sudden_change_detection(subset, self.config, self.report, self.dim_names)
-        self._states[current_mask] = subset
+        s1_sudden_change_detection(subset_st, self.config, self.report, self.dim_names)
+        s1_sudden_change_detection(subset_ac, self.config, self.report, self.dim_names, name_prefix="action_")
+        self._states[current_mask] = subset_st
+        self._actions[current_mask] = subset_ac
         return current_mask
 
     def _run_s2(self, current_mask: np.ndarray) -> np.ndarray:
@@ -594,11 +752,14 @@ class DataCleaningPipeline:
         return self._apply_mask(full_valid, "S2")
 
     def _run_s3(self, current_mask: np.ndarray) -> np.ndarray:
-        subset = self._states[current_mask]
-        if len(subset) == 0:
+        subset_st = self._states[current_mask]
+        subset_ac = self._actions[current_mask]
+        if len(subset_st) == 0:
             return current_mask
-        s3_extreme_value_filtering(subset, self.config, self.report, self.dim_names)
-        self._states[current_mask] = subset
+        s3_extreme_value_filtering(subset_st, self.config, self.report, self.dim_names)
+        s3_extreme_value_filtering(subset_ac, self.config, self.report, self.dim_names, name_prefix="action_")
+        self._states[current_mask] = subset_st
+        self._actions[current_mask] = subset_ac
         return current_mask
 
     def _run_s4(self, current_mask: np.ndarray) -> np.ndarray:
@@ -683,10 +844,6 @@ if __name__ == "__main__":
     pipeline = DataCleaningPipeline(config)
     mask = pipeline.run(data_root, stages=args.stages)
 
-    clean_df = pipeline.get_clean_data()
-    out_path = Path(data_root) / ".." / "pick_banana_100_newTable_1_offset_state_cleaned"
-    out_path.mkdir(exist_ok=True)
-    clean_df.to_parquet(out_path / "cleaned_data.parquet")
-    print(f"\nCleaned data saved to {out_path / 'cleaned_data.parquet'}")
-
-    pipeline.save_report(str(out_path / "cleaning_report.json"))
+    out_root = str(Path(data_root).parent / f"{Path(data_root).name}_cleaned")
+    pipeline.save_dataset(out_root)
+    print(f"\nCleaned dataset saved to {out_root}")
