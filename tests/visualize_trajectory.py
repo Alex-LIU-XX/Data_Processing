@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Visualize state (blue) and action (red) trajectories: raw + normalized (q01→[-1,1]) per episode, per-dim histograms, multi-episode overlays and histograms."""
+"""Visualize state (blue) and action (red) trajectories: raw + normalized (q01→[-1,1]) per episode, per-dim histograms, multi-episode overlays and histograms.
+python tests/visualize_trajectory.py --dataset-path example_data/pick_banana_100_newTable_1_offset_state --episode 0 1 2
+"""
 
 import argparse
 import json

@@ -1,0 +1,47 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run Data Cleaning Pipeline",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/data_cleaning_pipeline.py",
+            "args": [
+                "${workspaceFolder}/example_data/pick_banana_100_newTable_1_offset_state",
+                "--stages",
+                "S1_SuddenChange",
+                "S2_TrendAlignment",
+                "S3_ExtremeValue",
+                "S4_KinematicConsistency",
+                "S5_OrientationAlignment"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Run Data Cleaning Pipeline 2",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/data_cleaning_pipeline.py",
+            "args": [
+                "${workspaceFolder}/example_data/pick_banana_100_newTable_1_offset_state",
+                "--stages",
+                "S1_SuddenChange",
+                "S3_ExtremeValue"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Python: tests/visualize_trajectory.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tests/visualize_trajectory.py",
+            "env": {},
+            "console": "integratedTerminal",
+            "args": [
+                "--dataset-path","example_data/pick_banana_100_newTable_1_offset_state",
+                "--episode","0","1","2"
+            ],
+
+        }
+    ]
+}

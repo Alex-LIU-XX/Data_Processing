@@ -123,15 +123,15 @@ def s1_sudden_change_detection(
     dim_names: Optional[list[str]] = None,
 ) -> np.ndarray:
     """
-    检测并标记突变帧。
-    流程: 中值滤波 → SG平滑 → 计算残差/加速度/急动度 → 联合阈值判定。
+    检测突变帧并用平滑值替代（非丢弃）。
+    流程: 中值滤波 → SG平滑 → 计算残差/加速度/急动度 → 联合阈值判定 → 替代为平滑值。
     返回: bool mask (True=正常, False=异常)。
     """
     N, D = signals.shape
     valid = np.ones(N, dtype=bool)
 
     for d in range(D):
-        raw = signals[:, d].copy()
+        raw = signals[:, d]  # view, 修改会直接影响 signals
 
         # 级联中值滤波
         med_ksize = min(config.s1_medfilt_kernel, N - 1 if N % 2 == 0 else N)
@@ -169,11 +169,11 @@ def s1_sudden_change_detection(
 
         n_flagged = flagged.sum()
         if n_flagged > 0:
-            valid[flagged] = False
+            raw[flagged] = smoothed[flagged]  # 用平滑值替代，而非丢弃
             name = dim_names[d] if dim_names else f"dim_{d}"
-            report.add("S1", f"{name}: flagged {n_flagged} frames", {"dropped_frames": int(n_flagged)})
+            report.add("S1", f"{name}: smoothed {n_flagged} frames", {"smoothed_frames": int(n_flagged)})
 
-    report.add("S1", f"Total flagged: {(~valid).sum()} / {N} frames", {"dropped_frames": int((~valid).sum())})
+    report.add("S1", f"Total smoothed: {(~valid).sum()} / {N} frames")
     return valid
 
 
@@ -264,8 +264,9 @@ def s3_extreme_value_filtering(
     dim_names: Optional[list[str]] = None,
 ) -> np.ndarray:
     """
-    基于 Q1/Q99 的极值过滤。
-    返回: frame-level bool mask (True=保留, False=丢弃)。
+    基于 Q1/Q99 的极值裁剪（非丢弃）。
+    超限帧被裁剪到边界值。
+    返回: frame-level bool mask。
     """
     N, D = signals.shape
     valid = np.ones(N, dtype=bool)
@@ -287,11 +288,11 @@ def s3_extreme_value_filtering(
 
         flagged = (col < lower) | (col > upper)
         if flagged.sum() > 0:
-            valid[flagged] = False
-            report.add("S3", f"{name}: {flagged.sum()} frames out of [{lower:.4f}, {upper:.4f}]",
-                       {"dropped_frames": int(flagged.sum())})
+            col[flagged] = np.clip(col[flagged], lower, upper)  # 裁剪到边界，而非丢弃
+            report.add("S3", f"{name}: {flagged.sum()} frames clipped to [{lower:.4f}, {upper:.4f}]",
+                       {"clipped_frames": int(flagged.sum())})
 
-    report.add("S3", f"Total flagged: {(~valid).sum()} / {N} frames", {"dropped_frames": int((~valid).sum())})
+    report.add("S3", f"Total clipped: {(~valid).sum()} / {N} frames")
     return valid
 
 
@@ -574,13 +575,12 @@ class DataCleaningPipeline:
         return new_mask
 
     def _run_s1(self, current_mask: np.ndarray) -> np.ndarray:
-        states = self._states[current_mask]
-        if len(states) == 0:
+        subset = self._states[current_mask]
+        if len(subset) == 0:
             return current_mask
-        stage_valid = s1_sudden_change_detection(states, self.config, self.report, self.dim_names)
-        full_valid = np.ones(len(current_mask), dtype=bool)
-        full_valid[current_mask] = stage_valid
-        return self._apply_mask(full_valid, "S1")
+        s1_sudden_change_detection(subset, self.config, self.report, self.dim_names)
+        self._states[current_mask] = subset
+        return current_mask
 
     def _run_s2(self, current_mask: np.ndarray) -> np.ndarray:
         states, actions = self._states[current_mask], self._actions[current_mask]
@@ -594,13 +594,12 @@ class DataCleaningPipeline:
         return self._apply_mask(full_valid, "S2")
 
     def _run_s3(self, current_mask: np.ndarray) -> np.ndarray:
-        states = self._states[current_mask]
-        if len(states) == 0:
+        subset = self._states[current_mask]
+        if len(subset) == 0:
             return current_mask
-        stage_valid = s3_extreme_value_filtering(states, self.config, self.report, self.dim_names)
-        full_valid = np.ones(len(current_mask), dtype=bool)
-        full_valid[current_mask] = stage_valid
-        return self._apply_mask(full_valid, "S3")
+        s3_extreme_value_filtering(subset, self.config, self.report, self.dim_names)
+        self._states[current_mask] = subset
+        return current_mask
 
     def _run_s4(self, current_mask: np.ndarray) -> np.ndarray:
         states = self._states[current_mask]
@@ -654,9 +653,20 @@ class DataCleaningPipeline:
 # ─── 主入口 ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    data_root = sys.argv[1] if len(sys.argv) > 1 else \
+    parser = argparse.ArgumentParser(description="Data Cleaning Pipeline")
+    parser.add_argument("data_root", nargs="?", default=None,
+                        help="Path to dataset root")
+    parser.add_argument("--stages", nargs="+", default=None,
+                        choices=["S1_SuddenChange", "S2_TrendAlignment", "S3_ExtremeValue",
+                                 "S4_KinematicConsistency", "S5_OrientationAlignment",
+                                 "C1_InstructionConsistency", "C2_VideoStateConsistency",
+                                 "C3_VideoQuality"],
+                        help="Stages to run (default: S1 + S3)")
+    args = parser.parse_args()
+
+    data_root = args.data_root if args.data_root else \
         "/home/alex/workspace/Code/数据优化算子/example_data/pick_banana_100_newTable_1_offset_state"
 
     config = CleaningConfig(
@@ -668,8 +678,10 @@ if __name__ == "__main__":
         s3_gripper_exempt=True,
     )
 
+    if args.stages is None:
+        args.stages = ["S1_SuddenChange", "S3_ExtremeValue"]
     pipeline = DataCleaningPipeline(config)
-    mask = pipeline.run(data_root)
+    mask = pipeline.run(data_root, stages=args.stages)
 
     clean_df = pipeline.get_clean_data()
     out_path = Path(data_root) / ".." / "pick_banana_100_newTable_1_offset_state_cleaned"
